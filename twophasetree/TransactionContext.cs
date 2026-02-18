@@ -1,82 +1,70 @@
 namespace transaction.twophasetree;
 
-class TrChannels(TransId transId)
+public class TransactionContext : ITransactionContext
 {
-    public TransId TransId = transId;
-    public Channel<PartResult> _resultChannel = new();
-    public Channel<double> _progressChannel = new();
-    public Channel<TrDecision> _decisionChannel = new();
-    public ITransactionContext InstantiateContext()
-        => new TransactionContext(this);
-}
+    readonly TrChannels _parentCh;
+    readonly TrChannels _internalCh;
+    readonly List<TrChannels> _children;
 
-class TransactionParticipant(TrChannels ch)
-    : ITransactionParticipant
-{
-    public IReceive<double> Progress => ch._progressChannel;
-    public IReceive<PartResult> Result => ch._resultChannel;
-    public void Decided(TrDecision decision)
+    public TransactionContext(TrChannels parentCh)
     {
-        if (decision != TrDecision.None)
-            ch._decisionChannel.Push(decision);
+        _parentCh = parentCh;
+        _internalCh = new(parentCh.TransId);
+        _children = [_internalCh];
+        _parentCh._decision.Listen(decision =>
+            _children.ForEach(br => br._decision.Push(decision))
+        );
     }
-}
 
-class TransactionContext : ITransactionContext
-{
-    private readonly TransId _transId;
-    private readonly TrChannels _parent;
-    private readonly Channel<TrDecision> _decision = new();
-    private readonly List<ITransactionParticipant> _branches = [];
-    private PartResult? _localResult;
-    private double _localProgress;
+    public TransId GetTransId() => _parentCh.TransId;
 
-    public TransactionContext(TrChannels ch)
+    public void Progress(double percent)
     {
-        _parent = ch;
-        _transId = ch.TransId;
-        _parent._decisionChannel.Listen(decision =>
+        _internalCh._progress.Push(percent);
+        SignalProgress();
+    }
+
+    private void SignalProgress() => _parentCh._progress.Push(_children.Average(br => br._progress.Poll()));
+
+    public void Ready(bool readyToCommit, string? message = null)
+    {
+        var result = new PartResult(readyToCommit, message);
+        _internalCh._result.Push(result);
+        SignalResult(result);
+    }
+
+    private void SignalResult(PartResult res)
+    {
+        if (!res.CanCommit || _children.All(ch => ch._result.Poll()?.CanCommit ?? false))
         {
-            _decision.Push(decision);
-            _branches.ForEach(p => p.Decided(decision));
-        });
-    }
-
-    public TransId GetTransId() => _transId;
-
-    public void SendProgress(double percent)
-    {
-        _localProgress = percent;
-        TransmitProgress();
-    }
-    public void SendResult(bool success, string? message = null)
-    {
-        if (success) SendProgress(100);
-        TransmitResult(_localResult = new PartResult(success, message));
-    }
-    private void TransmitProgress()
-    {
-        var sum = _branches.Sum(p => p.Progress.Poll());
-        _parent._progressChannel.Push((_localProgress + sum) / (1.0 + _branches.Count));
-    }
-    private void TransmitResult(PartResult result) //up tree
-    {
-        static bool Good(PartResult? r) => r?.Success ?? false;
-        if ((Good(_localResult)
-                && _branches.All(ctx => Good(ctx.Result.Poll()))
-            ) || !result.Success)
-        {
-            _parent._resultChannel.Push(result);
+            if (res.CanCommit) Progress(100);
+            _parentCh._result.Push(res);
         }
     }
-    public IReceive<TrDecision> Decision() => _decision;
+
+    public IReceive<TrDecision> Decision() => _internalCh._decision;
+
     public ITransactionContext Branch()
     {
-        var cm = new TrChannels(_transId);
-        var tp = new TransactionParticipant(cm);
-        tp.Result.Listen(receive => TransmitResult(receive));
-        tp.Progress.Listen(_ => TransmitProgress());
-        _branches.Add(tp);
-        return cm.InstantiateContext();
+        var ch = new TrChannels(GetTransId());
+        ch._progress.Listen(pct => SignalProgress());
+        ch._result.Listen(SignalResult);
+        _children.Add(ch);
+        return new TransactionContext(ch);
+    }
+
+    public static ITransactionContext InitiateDefaultController(TransId transId, Action<string> Log)
+    {
+        var ch = new TrChannels(transId);
+        ch._progress.Listen(pct =>
+        {
+            Log($"{pct:0.}%");
+        });
+        ch._result.Listen(receive =>
+        {
+            Log($"Accumulated result from participants: {receive}");
+            ch._decision.Push(receive.ToDecision());
+        });
+        return new TransactionContext(ch);
     }
 }
