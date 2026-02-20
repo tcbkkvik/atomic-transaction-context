@@ -28,17 +28,20 @@ public class TransactionContext : ITransactionContext
 
     public void Ready(bool readyToCommit, string? message = null)
     {
-        var result = new PartResult(readyToCommit, message);
-        _internalCh._result.Push(result);
-        SignalResult(result);
+        var old = _internalCh._ready.Poll();
+        var ready = old == null
+            ? new PartReady(readyToCommit, message)
+            : new PartReady(readyToCommit && old.CanCommit, message ?? old.Message);
+        _internalCh._ready.Push(ready);
+        SignalReady(ready);
     }
 
-    private void SignalResult(PartResult res)
+    private void SignalReady(PartReady res)
     {
-        if (!res.CanCommit || _children.All(ch => ch._result.Poll()?.CanCommit ?? false))
+        if (!res.CanCommit || _children.All(ch => ch._ready.Poll()?.CanCommit ?? false))
         {
             if (res.CanCommit) Progress(100);
-            _parentCh._result.Push(res);
+            _parentCh._ready.Push(res);
         }
     }
 
@@ -48,7 +51,7 @@ public class TransactionContext : ITransactionContext
     {
         var ch = new TrChannels(GetTransId());
         ch._progress.Listen(pct => SignalProgress());
-        ch._result.Listen(SignalResult);
+        ch._ready.Listen(SignalReady);
         _children.Add(ch);
         return new TransactionContext(ch);
     }
@@ -60,7 +63,7 @@ public class TransactionContext : ITransactionContext
         {
             Log($"{pct:0.}%");
         });
-        ch._result.Listen(receive =>
+        ch._ready.Listen(receive =>
         {
             Log($"Accumulated result from participants: {receive}");
             ch._decision.Push(receive.ToDecision());

@@ -25,12 +25,11 @@ public class TransIdGenerator(string site)
 
 public enum TrDecision
 {
-    None,
     Commit,
     Rollback,
 }
 
-public record PartResult(bool CanCommit, string? Message)
+public record PartReady(bool CanCommit, string? Message)
 {
     public override string ToString() => $"(Success:{CanCommit}, Message:'{Message}')";
     public TrDecision ToDecision() => CanCommit ? TrDecision.Commit : TrDecision.Rollback;
@@ -46,8 +45,11 @@ public class SimpleChannel<T> : IReceive<T>
 {
     private T? _value;
     private Action<T>? _action;
+    private int _pushCount;
+    public int PushCount() => _pushCount;
     public void Push(T value)
     {
+        _pushCount++;
         _value = value;
         _action?.Invoke(value);
     }
@@ -55,14 +57,15 @@ public class SimpleChannel<T> : IReceive<T>
     public void Listen(Action<T> action)
     {
         _action = action;
-        if (_value is not null) _action?.Invoke(_value);
+        if (_value is not null && _pushCount > 0)
+            _action?.Invoke(_value);
     }
 }
 
 public class TrChannels(TransId transId)
 {
     public TransId TransId = transId;
-    public SimpleChannel<PartResult> _result = new();
+    public SimpleChannel<PartReady> _ready = new();
     public SimpleChannel<double> _progress = new();
     public SimpleChannel<TrDecision> _decision = new();
 }

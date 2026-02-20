@@ -2,61 +2,42 @@ namespace transaction.twophasetree;
 
 public class Demo
 {
-    private class AParticipantNode(int initialValue)
+    private static int _nodeIndex;
+
+    private class AParticipantNode
     {
-        private static int _nodeIndex;
-        private readonly string _prefix = $"{" ".PadLeft(++_nodeIndex * 20)}Node{_nodeIndex} ";
+        private readonly int _myNodeId = ++_nodeIndex;
+        private readonly string _prefix;
+        private readonly string _prefixLeftA;
+        private readonly string _prefixRightA;
+        private int _state;
+
         private void Log(string msg) => Console.WriteLine(_prefix + msg);
+        private void LogL(string msg) => Console.WriteLine(_prefixLeftA + msg);
+        private void LogR(string msg) => Console.WriteLine(_prefixRightA + msg);
 
-        private int _value = initialValue;
-        private readonly Dictionary<TransId, int> _transactionDict = []; //TID-versioned values
-
-        /*ACID:
-           Atomic: Either fully updated on commit or not applied at all on rollback.
-                -> Two-phase commit ensures atomicity across 
-                    distributed services; the main feature of this demo.
-           Consistent: Value only updated (visible outside transaction)
-                 if transaction commits, otherwise unchanged.
-                -> Mutually consistent state across distributed services on/after commit.
-           Isolated: Value is isolated per transaction (no interference) until Decision is made.
-                -> TransId=>Value mapping ensures isolation.
-           Durable: Once committed, the value is updated and will not be lost.
-                -> Value in _transactionDict should already be in reliable storage 
-                    BEFORE responding ready-to-commit to TransactionCoordinator. 
-                    In this demo, we assume in-memory is durable for simplicity.
-        */
-
-        private static int Process(int input) => input * 2;
-
-        public void SimpleUpdate(int newValue)
+        public AParticipantNode(int initialState)
         {
-            _value = newValue;
-            Log($"Non-transactional update: {_value})->{newValue}");
+            _state = initialState;
+            var hSpace = new string('-', _myNodeId * 15);
+            var hLine = new string('-', _myNodeId * 15);
+            _prefix = $"    {hSpace}      Node{_nodeIndex} ";
+            _prefixLeftA = $"    <-{hLine}    Node{_nodeIndex} ";
+            _prefixRightA = $"    {hLine}->    Node{_nodeIndex} ";
         }
 
-        public Task Update(ITransactionContext ctx, int newValue)
+        public Task Update(ITransactionContext ctx, int newState)
         {
-            var tid = ctx.GetTransId();
-            if (_transactionDict.ContainsKey(tid))
-            {
-                Log($"{tid} exists, idempotent: ignoring update");
-                return Task.CompletedTask;
-            }
-            Log($"Starting update({tid}, value:{_value})->f({newValue})");
+            LogR($"Starting update({ctx.GetTransId()}, value:{_state})->f({newState})");
             ctx.Decision().Listen(d =>
             {
-                if (d == TrDecision.None) return;
-                if (d == TrDecision.Commit && _transactionDict.TryGetValue(tid, out var trxValue))
-                {
-                    _value = trxValue;
-                }
-                _transactionDict.Remove(tid);
-                Log($"Done: {d} -> {_value}");
+                if (d == TrDecision.Commit)
+                    _state = newState;
+                LogR($"Done: {d} -> {_state}");
             });
-            _transactionDict[tid] = _value;
             return Task.Run(async () =>
             {
-                for (double pct = 1; pct < 100; pct += Random.Shared.Next(18,44))
+                for (double pct = 1; pct < 100; pct += Random.Shared.Next(18, 44))
                 {
                     await Task.Delay(Random.Shared.Next(0, 9));
                     if (ctx.Decision().Poll() == TrDecision.Rollback)
@@ -64,15 +45,89 @@ public class Demo
                         Log("Rollback... stopping update");
                         return;
                     }
-                    Log($"{pct:0.}%");
+                    LogL($"{pct:0.}%");
                     ctx.Progress(pct);
                 }
-                var processedValue = Process(newValue);
-                _transactionDict[tid] = processedValue;
-                Log("Ready to commit " + processedValue);
+                LogL("Ready to commit " + newState);
                 ctx.Ready(true);
             });
         }
+    }
+
+    /*ACID:
+        Atomic(coordinator): Either fully updated on commit or not applied at all on rollback.
+            -> Two-phase commit ensures atomicity across 
+                distributed services; the main feature of this demo.
+        Consistent(local): Value only updated (visible outside transaction)
+                if transaction commits, otherwise unchanged.
+            -> Mutually consistent state across distributed services on/after commit.
+        Isolated(local): Value is isolated per transaction (no interference) until Decision is made.
+            -> TransId=>Value mapping ensures isolation.
+        Durable(local): Once committed, the value is updated and will not be lost.
+            -> Value in _transactionDict should already be in reliable storage 
+                BEFORE responding ready-to-commit to TransactionCoordinator. 
+                In this demo, we assume in-memory is durable for simplicity.
+    */
+
+    interface IDbOperation { }
+    interface IDbResponse
+    {
+        bool Success();
+        string? Message();
+        object ResponseData();
+    }
+    interface IDbRecordSet
+    {
+        IDbRecordSet ForkChangeSet();
+
+        /// <summary>
+        /// Process an operation on this record set.
+        /// If ctx is provided, the implementation..
+        ///  * Should validate and save result, or fail (C+D in ACID: Consistency, Durability)
+        ///  * Can use ctx.Progress(%) to signal progress.
+        ///  * Can use ctx.Decision().Poll() to check for early abort. (e.g. if any participant voted no)
+        /// </summary>
+        /// <param name="ctx">Transaction Context</param>
+        /// <param name="op">Operation</param>
+        /// <returns>Response from the database operation</returns>
+        IDbResponse ProcessOp(ITransactionContext? ctx, IDbOperation op);
+
+        void CommitChangeSet(IDbRecordSet changedSet);
+    }
+
+    class GenericDbNode(IDbRecordSet database)
+    {
+        private readonly Dictionary<TransId, IDbRecordSet> _pendingChanges = [];
+
+        public IDbResponse Operation(ITransactionContext? ctx, IDbOperation op)
+        {
+            if (ctx == null)
+            {   //Non-transactional; Directly on main database
+                return database.ProcessOp(null, op);
+            }
+            //Transactional; 
+            // * Operation is on changeSet     => Isolation (I in ACID)
+            // * TwoPhaseCommit (Ready, Decision) => Atomic (A in ACID)
+            var changeSet = _pendingChanges
+                .TryGetValue(ctx.GetTransId(), out var existingChangeSet)
+                ? existingChangeSet
+                : _pendingChanges[ctx.GetTransId()] = database.ForkChangeSet();
+
+            var response = changeSet.ProcessOp(ctx, op);
+            ctx.Ready(response.Success(), response.Message());
+            ctx.Decision().Listen(vote =>
+            {
+                if (vote == TrDecision.Commit)
+                    database.CommitChangeSet(changeSet);
+                _pendingChanges.Remove(ctx.GetTransId());
+            });
+            return response;
+        }
+    }
+
+    class SqlDbNode
+    {
+        //todo?
     }
 
     private static readonly TransIdGenerator TidGenerator = new("Demo");
