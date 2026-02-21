@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using Dapper;
+using System.Collections.Concurrent;
 
 namespace transaction.twophasetree;
 
@@ -102,7 +103,7 @@ public class Demo
 
     class GenericDatabase(IDbRecordSet database)
     {
-        private readonly Dictionary<TransId, IDbRecordSet> _pendingChanges = [];
+        private readonly ConcurrentDictionary<TransId, IDbRecordSet> _pendingChanges = [];
 
         public IDbResponse Operation(ITransactionContext? ctx, IDbOperation op)
         {
@@ -110,26 +111,19 @@ public class Demo
             {   //Non-transactional; Directly on main database
                 return database.Operation(null, op);
             }
-            //Transactional; 
+            //Transactional;
             //  - Operation is on changeSet     => Isolation (I in ACID)
             //  - TwoPhaseCommit (Ready, Decision) => Atomic (A in ACID)
-            var changeSet = _pendingChanges
-                .TryGetValue(ctx.GetTransId(), out var existingChangeSet)
-                ? existingChangeSet
-                : _pendingChanges[ctx.GetTransId()] = database.ForkChangeSet();
-
-            //Phase One: Execute the operation on a branched changeSet, but do not commit to main database yet.
+            var changeSet = _pendingChanges.GetOrAdd(ctx.GetTransId(), _ => database.ForkChangeSet());
             var response = changeSet.Operation(ctx, op);
-
             ctx.Ready(response.Success(), response.Message());
             ctx.Decision().Listen(vote =>
             {
-                //Phase Two: On commit, commit the changeSet to main database; on rollback, discard the changeSet.
                 if (vote == TrDecision.Commit)
                 {
                     database.CommitChangeSet(changeSet);
                 }
-                _pendingChanges.Remove(ctx.GetTransId());
+                _pendingChanges.TryRemove(ctx.GetTransId(), out var _);
             });
             return response;
         }
@@ -137,12 +131,6 @@ public class Demo
 
     class SqlDbNode
     {
-        // public class MockResponse : IDbResponse
-        // {
-        //     public string? Message() => "mockResp";
-        //     public object ResponseData() => new { Data = "mockData" };
-        //     public bool Success() => true;
-        // }
         protected readonly SqliteConnection conn = new("Data Source=:memory:");
         protected readonly Dictionary<TransId, SqliteTransaction> _pending = [];
         public SqlDbNode()
@@ -162,46 +150,34 @@ public class Demo
                 ? transaction : (_pending[tid] = conn.BeginTransaction());
     }
 
-    class SqlDbNode_v1 : SqlDbNode
+    class SqlDbNode_FullContext : SqlDbNode
     {
         public object? Op(ITransactionContext ctx)
         {
-            //Phase One: Execute the SQL statement in a transaction, but do not commit yet.
-            var trx = GetOrCreateTransaction(ctx.GetTransId());
-            var response = conn.Query("SELECT * FROM Users", transaction: trx)
-                .ToList();
-            foreach (var row in response)
-            {
-                Console.WriteLine($"From select: Id={row.Id}, Name={row.Name}");
-            }
+            var response = conn.Query("SELECT * FROM Users",
+                transaction: GetOrCreateTransaction(ctx.GetTransId())).ToList();
             ctx.Ready(response != null);
             ctx.Decision().Listen(vote =>
             {
-                if (!_pending.TryGetValue(ctx.GetTransId(), out var transaction))
-                    return; //outdated decision, transaction already removed.
-                //Phase Two: On commit, commit the transaction; on rollback, roll it back.
-                if (vote == TrDecision.Commit)
-                    transaction.Commit();
-                else
-                    transaction.Rollback();
-                _pending.Remove(ctx.GetTransId());
-                transaction.Dispose();
+                if (_pending.TryGetValue(ctx.GetTransId(), out var transaction))
+                {
+                    if (vote == TrDecision.Commit) transaction.Commit();
+                    else transaction.Rollback();
+                    _pending.Remove(ctx.GetTransId());
+                    transaction.Dispose();
+                }
             });
             return response;
         }
     }
 
-    class SqlDbNode_v2 : SqlDbNode
+    class SqlDbNode_TidOnly : SqlDbNode
     {
-        // Phase One
         public object? Op(TransId tid, string sql, object? param = null)
         {
-            return conn.Query("SELECT * FROM Users", transaction: GetOrCreateTransaction(tid))
-                .ToList();
-            // return new MockResponse();
+            return conn.Query("SELECT * FROM Users", 
+                transaction: GetOrCreateTransaction(tid)).ToList();
         }
-
-        // Phase Two
         public void Decided(TransId tid, TrDecision vote)
         {
             if (_pending.TryGetValue(tid, out var transaction))
@@ -229,7 +205,7 @@ public class Demo
             }
             private void RemoteDecided(string localTID, TrDecision vote) => Console.WriteLine($"    {vote} -> {name},{localTID}");
             private readonly Dictionary<TransId, string> _transactionIdMap = [];
-            
+
 
             private string ToLocalTrId(TransId tid) => _transactionIdMap.TryGetValue(tid, out var localTid)
                     ? localTid : (_transactionIdMap[tid] = $"{tid.Id}_{name}");
@@ -242,8 +218,8 @@ public class Demo
 
         readonly DbProxy _sqlServer = new("SqlServer");
         readonly DbProxy _partnerDb = new("PartnerDb");
-        readonly SqlDbNode_v1 sqlDbNode_V1 = new();
-        readonly SqlDbNode_v2 sqlDbNode_V2 = new();
+        readonly SqlDbNode_FullContext sqlDbNode_V1 = new();
+        readonly SqlDbNode_TidOnly sqlDbNode_V2 = new();
 
         public void CrossSiteDb2PCExample()
         {
@@ -260,11 +236,8 @@ public class Demo
             object? resultV3 = sqlDbNode_V2.Op(sharedTransId, "");
 
             //Phase 2
-            var allSucceeded = success1
-                && success2
-                && resultV1 != null
-                && resultV2 != null
-                ;
+            var allSucceeded = success1&& success2
+                && resultV1 != null&& resultV2 != null;
             var vote = allSucceeded ? TrDecision.Commit : TrDecision.Rollback;
             Console.WriteLine($"Overall decision: {vote}");
 
