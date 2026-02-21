@@ -19,8 +19,9 @@ public partial class Demo
 
         /// <summary>
         /// Process an operation on this record set.
-        /// If ctx is provided, the implementation should
-        /// validate and save result (C+D in ACID: Consistency, Durability)
+        /// If ctx is provided, the implementation should:
+        ///  - Validate     => Consistency (C in ACID)
+        ///  - Save result  => Durability  (D in ACID)
         /// </summary>
         /// <param name="ctx">Transaction Context</param>
         /// <param name="op">Operation</param>
@@ -29,7 +30,7 @@ public partial class Demo
 
         void CommitChangeSet(IDbRecordSet changedSet);
     }
-    
+
     public class GenericDatabaseParticipant(IDbRecordSet database)
     {
         private readonly ConcurrentDictionary<TransId, IDbRecordSet> _pendingChanges = [];
