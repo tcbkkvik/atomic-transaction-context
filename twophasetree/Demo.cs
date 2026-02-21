@@ -1,10 +1,9 @@
 using Microsoft.Data.Sqlite;
 using Dapper;
-using System.Collections.Concurrent;
 
 namespace transaction.twophasetree;
 
-public class Demo
+public partial class Demo
 {
     private static int _nodeIndex;
 
@@ -75,60 +74,6 @@ public class Demo
                 In this demo, we assume in-memory is durable for simplicity.
     */
 
-    interface IDbOperation { }
-    interface IDbResponse
-    {
-        bool Success();
-        string? Message();
-        object ResponseData();
-    }
-    interface IDbRecordSet
-    {
-        IDbRecordSet ForkChangeSet();
-
-        /// <summary>
-        /// Process an operation on this record set.
-        /// If ctx is provided, the implementation..
-        ///  * Should validate and save result, or fail (C+D in ACID: Consistency, Durability)
-        ///  * Can use ctx.Progress(%) to signal progress.
-        ///  * Can use ctx.Decision().Poll() to check for early abort. (e.g. if any participant voted no)
-        /// </summary>
-        /// <param name="ctx">Transaction Context</param>
-        /// <param name="op">Operation</param>
-        /// <returns>Response from the database operation</returns>
-        IDbResponse Operation(ITransactionContext? ctx, IDbOperation op);
-
-        void CommitChangeSet(IDbRecordSet changedSet);
-    }
-
-    class GenericDatabase(IDbRecordSet database)
-    {
-        private readonly ConcurrentDictionary<TransId, IDbRecordSet> _pendingChanges = [];
-
-        public IDbResponse Operation(ITransactionContext? ctx, IDbOperation op)
-        {
-            if (ctx == null)
-            {   //Non-transactional; Directly on main database
-                return database.Operation(null, op);
-            }
-            //Transactional;
-            //  - Operation is on changeSet     => Isolation (I in ACID)
-            //  - TwoPhaseCommit (Ready, Decision) => Atomic (A in ACID)
-            var changeSet = _pendingChanges.GetOrAdd(ctx.GetTransId(), _ => database.ForkChangeSet());
-            var response = changeSet.Operation(ctx, op);
-            ctx.Ready(response.Success(), response.Message());
-            ctx.Decision().Listen(vote =>
-            {
-                if (vote == TrDecision.Commit)
-                {
-                    database.CommitChangeSet(changeSet);
-                }
-                _pendingChanges.TryRemove(ctx.GetTransId(), out var _);
-            });
-            return response;
-        }
-    }
-
     class SqlDbNode
     {
         protected readonly SqliteConnection conn = new("Data Source=:memory:");
@@ -190,36 +135,36 @@ public class Demo
         }
     }
 
+    class DbProxy(string name)
+    {
+        private (bool Success, object result) RemoteOp(string localTID, object op)
+        {
+            bool success = Random.Shared.NextDouble()
+                > 0.2; //Simulate 80% success rate
+            var msg = $"  Executed ({(success ? "Success" : "Failure")})"
+                + $" on {name},{localTID}: {op}";
+            Console.WriteLine(msg);
+            return (success, msg);
+        }
+        private void RemoteDecided(string localTID, TrDecision vote) => Console.WriteLine($"    {vote} -> {name},{localTID}");
+        private readonly Dictionary<TransId, string> _transactionIdMap = [];
+
+
+        private string ToLocalTrId(TransId tid) => _transactionIdMap.TryGetValue(tid, out var localTid)
+                ? localTid : (_transactionIdMap[tid] = $"{tid.Id}_{name}");
+        //Public Proxy methods; maps global=>specific TID before real(remote) DB call.
+        public (bool Success, object result) Op(TransId tid, object op)
+            => RemoteOp(ToLocalTrId(tid), op);
+        public void Decide(TransId tid, TrDecision vote)
+            => RemoteDecided(ToLocalTrId(tid), vote);
+    }
+
     class SimulateDatabaseCluster
     {
-        class DbProxy(string name)
-        {
-            private (bool Success, object result) RemoteOp(string localTID, object op)
-            {
-                bool success = Random.Shared.NextDouble()
-                    > 0.2; //Simulate 80% success rate
-                var msg = $"  Executed ({(success ? "Success" : "Failure")})"
-                    + $" on {name},{localTID}: {op}";
-                Console.WriteLine(msg);
-                return (success, msg);
-            }
-            private void RemoteDecided(string localTID, TrDecision vote) => Console.WriteLine($"    {vote} -> {name},{localTID}");
-            private readonly Dictionary<TransId, string> _transactionIdMap = [];
-
-
-            private string ToLocalTrId(TransId tid) => _transactionIdMap.TryGetValue(tid, out var localTid)
-                    ? localTid : (_transactionIdMap[tid] = $"{tid.Id}_{name}");
-            //Public Proxy methods; maps global=>specific TID before real(remote) DB call.
-            public (bool Success, object result) Op(TransId tid, object op)
-                => RemoteOp(ToLocalTrId(tid), op);
-            public void Decide(TransId tid, TrDecision vote)
-                => RemoteDecided(ToLocalTrId(tid), vote);
-        }
-
         readonly DbProxy _sqlServer = new("SqlServer");
         readonly DbProxy _partnerDb = new("PartnerDb");
-        readonly SqlDbNode_FullContext sqlDbNode_V1 = new();
-        readonly SqlDbNode_TidOnly sqlDbNode_V2 = new();
+        readonly SqlDbNode_FullContext _sqlDbNode_ctx = new();
+        readonly SqlDbNode_TidOnly _sqlDbNode_tid = new();
 
         public void CrossSiteDb2PCExample()
         {
@@ -231,9 +176,9 @@ public class Demo
             var (success1, _) = _partnerDb.Op(sharedTransId, new { Op = "Update", Table = "Users", Id = 123, NewAlias = "Alice1" });
             var (success2, _) = _sqlServer.Op(sharedTransId, new { Op = "Insert", Table = "AuditLog", UserId = 123, Action = "NameChange", Timestamp = DateTime.UtcNow });
             var coordinator = TransactionContext.InitiateDefaultController(sharedTransId, Console.WriteLine);
-            object? resultV1 = sqlDbNode_V1.Op(coordinator);
-            object? resultV2 = sqlDbNode_V2.Op(sharedTransId, "UPDATE Users SET Alias='Alice1' WHERE Id=123");
-            object? resultV3 = sqlDbNode_V2.Op(sharedTransId, "");
+            object? resultV1 = _sqlDbNode_ctx.Op(coordinator);
+            object? resultV2 = _sqlDbNode_tid.Op(sharedTransId, "UPDATE Users SET Alias='Alice1' WHERE Id=123");
+            object? resultV3 = _sqlDbNode_tid.Op(sharedTransId, "");
 
             //Phase 2
             var allSucceeded = success1&& success2
@@ -244,7 +189,7 @@ public class Demo
             _partnerDb.Decide(sharedTransId, vote);
             _sqlServer.Decide(sharedTransId, vote);
             coordinator.Ready(vote == TrDecision.Commit);
-            sqlDbNode_V2.Decided(sharedTransId, vote);
+            _sqlDbNode_tid.Decided(sharedTransId, vote);
         }
     }
 
@@ -263,9 +208,11 @@ public class Demo
         var s1 = new AParticipantNode(200);
         var s2 = new AParticipantNode(5);
 
+        //Phase 1
         var task1 = s1.Update(controller.Branch(), 450);
         var task2 = s2.Update(controller.Branch(), 7);
 
+        //Phase 2
         Task.WaitAll(task1, task2);
         controller.Ready(true);
     }
