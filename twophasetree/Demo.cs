@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using Dapper;
+using System.Collections.Concurrent;
 
 namespace transaction.twophasetree;
 
@@ -77,7 +78,7 @@ public partial class Demo
     class SqlDbNode
     {
         protected readonly SqliteConnection conn = new("Data Source=:memory:");
-        protected readonly Dictionary<TransId, SqliteTransaction> _pending = [];
+        protected readonly ConcurrentDictionary<TransId, SqliteTransaction> _pending = [];
         public SqlDbNode()
         {
             conn.Open();
@@ -91,8 +92,7 @@ public partial class Demo
 
         }
         protected SqliteTransaction GetOrCreateTransaction(TransId tid)
-            => _pending.TryGetValue(tid, out var transaction)
-                ? transaction : (_pending[tid] = conn.BeginTransaction());
+            => _pending.GetOrAdd(tid, _ => conn.BeginTransaction());
     }
 
     class SqlDbNode_FullContext : SqlDbNode
@@ -108,7 +108,7 @@ public partial class Demo
                 {
                     if (vote == TrDecision.Commit) transaction.Commit();
                     else transaction.Rollback();
-                    _pending.Remove(ctx.GetTransId());
+                    _pending.TryRemove(ctx.GetTransId(), out var _);
                     transaction.Dispose();
                 }
             });
@@ -120,7 +120,7 @@ public partial class Demo
     {
         public object? Op(TransId tid, string sql, object? param = null)
         {
-            return conn.Query("SELECT * FROM Users", 
+            return conn.Query("SELECT * FROM Users",
                 transaction: GetOrCreateTransaction(tid)).ToList();
         }
         public void Decided(TransId tid, TrDecision vote)
@@ -129,7 +129,7 @@ public partial class Demo
             {
                 if (vote == TrDecision.Commit) transaction.Commit();
                 else transaction.Rollback();
-                _pending.Remove(tid);
+                _pending.TryRemove(tid, out var _);
                 transaction.Dispose();
             }
         }
@@ -147,11 +147,10 @@ public partial class Demo
             return (success, msg);
         }
         private void RemoteDecided(string localTID, TrDecision vote) => Console.WriteLine($"    {vote} -> {name},{localTID}");
-        private readonly Dictionary<TransId, string> _transactionIdMap = [];
 
+        private readonly ConcurrentDictionary<TransId, string> _transactionIdMap = [];
+        private string ToLocalTrId(TransId tid) => _transactionIdMap.GetOrAdd(tid, _ => $"{tid.Id}_{name}");
 
-        private string ToLocalTrId(TransId tid) => _transactionIdMap.TryGetValue(tid, out var localTid)
-                ? localTid : (_transactionIdMap[tid] = $"{tid.Id}_{name}");
         //Public Proxy methods; maps global=>specific TID before real(remote) DB call.
         public (bool Success, object result) Op(TransId tid, object op)
             => RemoteOp(ToLocalTrId(tid), op);
@@ -181,8 +180,8 @@ public partial class Demo
             object? resultV3 = _sqlDbNode_tid.Op(sharedTransId, "");
 
             //Phase 2
-            var allSucceeded = success1&& success2
-                && resultV1 != null&& resultV2 != null;
+            var allSucceeded = success1 && success2
+                && resultV1 != null && resultV2 != null;
             var vote = allSucceeded ? TrDecision.Commit : TrDecision.Rollback;
             Console.WriteLine($"Overall decision: {vote}");
 
