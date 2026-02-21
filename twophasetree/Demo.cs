@@ -1,3 +1,6 @@
+using Microsoft.Data.Sqlite;
+using Dapper;
+
 namespace transaction.twophasetree;
 
 public class Demo
@@ -7,36 +10,31 @@ public class Demo
     private class AParticipantNode
     {
         private readonly int _myNodeId = ++_nodeIndex;
-        private readonly string _prefix;
-        private readonly string _prefixLeftA;
+        private readonly string _prefix_Space;
+        private readonly string _prefixLeft_A;
         private readonly string _prefixRightA;
         private int _state;
 
-        private void Log(string msg) => Console.WriteLine(_prefix + msg);
-        private void LogL(string msg) => Console.WriteLine(_prefixLeftA + msg);
+        private void Log(string msg) => Console.WriteLine(_prefix_Space + msg);
+        private void LogL(string msg) => Console.WriteLine(_prefixLeft_A + msg);
         private void LogR(string msg) => Console.WriteLine(_prefixRightA + msg);
 
         public AParticipantNode(int initialState)
         {
             _state = initialState;
-            var hSpace = new string('-', _myNodeId * 15);
+            var hSpce = new string(' ', _myNodeId * 15);
             var hLine = new string('-', _myNodeId * 15);
-            _prefix = $"    {hSpace}      Node{_nodeIndex} ";
-            _prefixLeftA = $"    <-{hLine}    Node{_nodeIndex} ";
-            _prefixRightA = $"    {hLine}->    Node{_nodeIndex} ";
+            _prefix_Space = $"         {hSpce}  Node{_nodeIndex} ";
+            _prefixLeft_A = $"      <<-{hLine}  Node{_nodeIndex} ";
+            _prefixRightA = $"      {hLine}->>  Node{_nodeIndex} ";
         }
 
         public Task Update(ITransactionContext ctx, int newState)
         {
             LogR($"Starting update({ctx.GetTransId()}, value:{_state})->f({newState})");
-            ctx.Decision().Listen(d =>
-            {
-                if (d == TrDecision.Commit)
-                    _state = newState;
-                LogR($"Done: {d} -> {_state}");
-            });
             return Task.Run(async () =>
             {
+                //Phase One: Do the work to prepare for the update, and report progress.
                 for (double pct = 1; pct < 100; pct += Random.Shared.Next(18, 44))
                 {
                     await Task.Delay(Random.Shared.Next(0, 9));
@@ -50,6 +48,13 @@ public class Demo
                 }
                 LogL("Ready to commit " + newState);
                 ctx.Ready(true);
+                ctx.Decision().Listen(d =>
+                {
+                    //Phase Two: Wait for the decision from the coordinator, and commit or rollback accordingly.
+                    if (d == TrDecision.Commit)
+                        _state = newState;
+                    LogR($"Done: {d} -> {_state}");
+                });
             });
         }
     }
@@ -90,12 +95,12 @@ public class Demo
         /// <param name="ctx">Transaction Context</param>
         /// <param name="op">Operation</param>
         /// <returns>Response from the database operation</returns>
-        IDbResponse ProcessOp(ITransactionContext? ctx, IDbOperation op);
+        IDbResponse Operation(ITransactionContext? ctx, IDbOperation op);
 
         void CommitChangeSet(IDbRecordSet changedSet);
     }
 
-    class GenericDbNode(IDbRecordSet database)
+    class GenericDatabase(IDbRecordSet database)
     {
         private readonly Dictionary<TransId, IDbRecordSet> _pendingChanges = [];
 
@@ -103,22 +108,27 @@ public class Demo
         {
             if (ctx == null)
             {   //Non-transactional; Directly on main database
-                return database.ProcessOp(null, op);
+                return database.Operation(null, op);
             }
             //Transactional; 
-            // * Operation is on changeSet     => Isolation (I in ACID)
-            // * TwoPhaseCommit (Ready, Decision) => Atomic (A in ACID)
+            //  - Operation is on changeSet     => Isolation (I in ACID)
+            //  - TwoPhaseCommit (Ready, Decision) => Atomic (A in ACID)
             var changeSet = _pendingChanges
                 .TryGetValue(ctx.GetTransId(), out var existingChangeSet)
                 ? existingChangeSet
                 : _pendingChanges[ctx.GetTransId()] = database.ForkChangeSet();
 
-            var response = changeSet.ProcessOp(ctx, op);
+            //Phase One: Execute the operation on a branched changeSet, but do not commit to main database yet.
+            var response = changeSet.Operation(ctx, op);
+
             ctx.Ready(response.Success(), response.Message());
             ctx.Decision().Listen(vote =>
             {
+                //Phase Two: On commit, commit the changeSet to main database; on rollback, discard the changeSet.
                 if (vote == TrDecision.Commit)
+                {
                     database.CommitChangeSet(changeSet);
+                }
                 _pendingChanges.Remove(ctx.GetTransId());
             });
             return response;
@@ -127,14 +137,154 @@ public class Demo
 
     class SqlDbNode
     {
-        //todo?
+        // public class MockResponse : IDbResponse
+        // {
+        //     public string? Message() => "mockResp";
+        //     public object ResponseData() => new { Data = "mockData" };
+        //     public bool Success() => true;
+        // }
+        protected readonly SqliteConnection conn = new("Data Source=:memory:");
+        protected readonly Dictionary<TransId, SqliteTransaction> _pending = [];
+        public SqlDbNode()
+        {
+            conn.Open();
+            var tr = conn.BeginTransaction();
+            int a = conn.Execute("CREATE TABLE Users (Id INTEGER PRIMARY KEY, Name TEXT)");
+            int b = conn.Execute("INSERT INTO Users (Name) VALUES (@Name)", new { Name = "Alice" });
+            if (b != 1)
+                throw new Exception("Setup failed");
+            tr.Commit();
+            tr.Dispose();
+
+        }
+        protected SqliteTransaction GetOrCreateTransaction(TransId tid)
+            => _pending.TryGetValue(tid, out var transaction)
+                ? transaction : (_pending[tid] = conn.BeginTransaction());
+    }
+
+    class SqlDbNode_v1 : SqlDbNode
+    {
+        public object? Op(ITransactionContext ctx)
+        {
+            //Phase One: Execute the SQL statement in a transaction, but do not commit yet.
+            var trx = GetOrCreateTransaction(ctx.GetTransId());
+            var response = conn.Query("SELECT * FROM Users", transaction: trx)
+                .ToList();
+            foreach (var row in response)
+            {
+                Console.WriteLine($"From select: Id={row.Id}, Name={row.Name}");
+            }
+            ctx.Ready(response != null);
+            ctx.Decision().Listen(vote =>
+            {
+                if (!_pending.TryGetValue(ctx.GetTransId(), out var transaction))
+                    return; //outdated decision, transaction already removed.
+                //Phase Two: On commit, commit the transaction; on rollback, roll it back.
+                if (vote == TrDecision.Commit)
+                    transaction.Commit();
+                else
+                    transaction.Rollback();
+                _pending.Remove(ctx.GetTransId());
+                transaction.Dispose();
+            });
+            return response;
+        }
+    }
+
+    class SqlDbNode_v2 : SqlDbNode
+    {
+        // Phase One
+        public object? Op(TransId tid, string sql, object? param = null)
+        {
+            return conn.Query("SELECT * FROM Users", transaction: GetOrCreateTransaction(tid))
+                .ToList();
+            // return new MockResponse();
+        }
+
+        // Phase Two
+        public void Decided(TransId tid, TrDecision vote)
+        {
+            if (_pending.TryGetValue(tid, out var transaction))
+            {
+                if (vote == TrDecision.Commit) transaction.Commit();
+                else transaction.Rollback();
+                _pending.Remove(tid);
+                transaction.Dispose();
+            }
+        }
+    }
+
+    class SimulateDatabaseCluster
+    {
+        class DbProxy(string name)
+        {
+            private (bool Success, object result) RemoteOp(string localTID, object op)
+            {
+                bool success = Random.Shared.NextDouble()
+                    > 0.2; //Simulate 80% success rate
+                var msg = $"  Executed ({(success ? "Success" : "Failure")})"
+                    + $" on {name},{localTID}: {op}";
+                Console.WriteLine(msg);
+                return (success, msg);
+            }
+            private void RemoteDecided(string localTID, TrDecision vote) => Console.WriteLine($"    {vote} -> {name},{localTID}");
+            private readonly Dictionary<TransId, string> _transactionIdMap = [];
+            
+
+            private string ToLocalTrId(TransId tid) => _transactionIdMap.TryGetValue(tid, out var localTid)
+                    ? localTid : (_transactionIdMap[tid] = $"{tid.Id}_{name}");
+            //Public Proxy methods; maps global=>specific TID before real(remote) DB call.
+            public (bool Success, object result) Op(TransId tid, object op)
+                => RemoteOp(ToLocalTrId(tid), op);
+            public void Decide(TransId tid, TrDecision vote)
+                => RemoteDecided(ToLocalTrId(tid), vote);
+        }
+
+        readonly DbProxy _sqlServer = new("SqlServer");
+        readonly DbProxy _partnerDb = new("PartnerDb");
+        readonly SqlDbNode_v1 sqlDbNode_V1 = new();
+        readonly SqlDbNode_v2 sqlDbNode_V2 = new();
+
+        public void CrossSiteDb2PCExample()
+        {
+            Console.WriteLine("\nCrossSiteDatabaseOp");
+            //Shared transaction ID across multiple services/databases.
+            TransId sharedTransId = TidGenerator.Create();
+
+            //Phase 1
+            var (success1, _) = _partnerDb.Op(sharedTransId, new { Op = "Update", Table = "Users", Id = 123, NewAlias = "Alice1" });
+            var (success2, _) = _sqlServer.Op(sharedTransId, new { Op = "Insert", Table = "AuditLog", UserId = 123, Action = "NameChange", Timestamp = DateTime.UtcNow });
+            var coordinator = TransactionContext.InitiateDefaultController(sharedTransId, Console.WriteLine);
+            object? resultV1 = sqlDbNode_V1.Op(coordinator);
+            object? resultV2 = sqlDbNode_V2.Op(sharedTransId, "UPDATE Users SET Alias='Alice1' WHERE Id=123");
+            object? resultV3 = sqlDbNode_V2.Op(sharedTransId, "");
+
+            //Phase 2
+            var allSucceeded = success1
+                && success2
+                && resultV1 != null
+                && resultV2 != null
+                ;
+            var vote = allSucceeded ? TrDecision.Commit : TrDecision.Rollback;
+            Console.WriteLine($"Overall decision: {vote}");
+
+            _partnerDb.Decide(sharedTransId, vote);
+            _sqlServer.Decide(sharedTransId, vote);
+            coordinator.Ready(vote == TrDecision.Commit);
+            sqlDbNode_V2.Decided(sharedTransId, vote);
+        }
     }
 
     private static readonly TransIdGenerator TidGenerator = new("Demo");
 
     public static void SimulateDistributedTransaction()
     {
-        var controller = TransactionContext
+        SimulateDatabaseCluster cluster = new();
+        for (int i = 0; i < 4; i++)
+            cluster.CrossSiteDb2PCExample();
+
+        Console.WriteLine("\nInitiateDefaultController");
+        ITransactionContext controller = TransactionContext
             .InitiateDefaultController(TidGenerator.Create(), Console.WriteLine);
 
         var s1 = new AParticipantNode(200);
