@@ -18,9 +18,10 @@ public interface ITransactionContext
 flowchart
     T(2PC Coordinator
       T)
-    T --> A(A)
-    T --> B(B)
-    B --> C(C)
+    T --> A
+    T --> B
+    B --> C
+    B --> D
 ```
 
 ```mermaid
@@ -28,13 +29,17 @@ sequenceDiagram
     T->>+A: Start
     T->>+B: Start
     B->>+C: Start
+    B->>+D: Start
       A-->>T: Progress%
       C-->>B: Progress%
+      D-->>B: Progress%
       B-->>T: Progress%
       A->>-T: Ready
       C->>-B: Ready
+      D->>-B: Ready
       B->>-T: Ready
     T->>+A: Commit
     T->>+B: Commit
     B->>+C: Commit
+    B->>+D: Commit
 ```
