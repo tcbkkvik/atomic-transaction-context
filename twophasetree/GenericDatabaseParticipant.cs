@@ -19,9 +19,9 @@ public partial class Demo
 
         /// <summary>
         /// Process an operation on this record set.
-        /// If ctx is provided, the implementation should:
-        ///  - Validate     => Consistency (C in ACID)
-        ///  - Save result  => Durability  (D in ACID)
+        /// <br/>If ctx is provided, the implementation should:
+        /// <br/> - Validate result => Consistency (C in ACID)
+        /// <br/> - Save result     => Durability  (D in ACID)
         /// </summary>
         /// <param name="ctx">Transaction Context</param>
         /// <param name="op">Operation</param>

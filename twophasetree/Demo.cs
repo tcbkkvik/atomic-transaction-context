@@ -174,7 +174,7 @@ public partial class Demo
             //Phase 1
             var (success1, _) = _partnerDb.Op(sharedTransId, new { Op = "Update", Table = "Users", Id = 123, NewAlias = "Alice1" });
             var (success2, _) = _sqlServer.Op(sharedTransId, new { Op = "Insert", Table = "AuditLog", UserId = 123, Action = "NameChange", Timestamp = DateTime.UtcNow });
-            var coordinator = TransactionContext.InitiateDefaultController(sharedTransId, Console.WriteLine);
+            var coordinator = TransactionContext.InitDefaultCoordinator(sharedTransId, Console.WriteLine);
             object? resultV1 = _sqlDbNode_ctx.Op(coordinator);
             object? resultV2 = _sqlDbNode_tid.Op(sharedTransId, "UPDATE Users SET Alias='Alice1' WHERE Id=123");
             object? resultV3 = _sqlDbNode_tid.Op(sharedTransId, "");
@@ -202,7 +202,7 @@ public partial class Demo
 
         Console.WriteLine("\nInitiateDefaultController");
         ITransactionContext controller = TransactionContext
-            .InitiateDefaultController(TidGenerator.Create(), Console.WriteLine);
+            .InitDefaultCoordinator(TidGenerator.Create(), Console.WriteLine);
 
         var s1 = new AParticipantNode(200);
         var s2 = new AParticipantNode(5);

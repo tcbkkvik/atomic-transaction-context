@@ -10,7 +10,7 @@ public class TransactionContext : ITransactionContext
     {
         _parentCh = parentCh;
         _internalCh = new(parentCh.TransId);
-        _children = [_internalCh];
+            _children = [_internalCh];
         _parentCh._decision.Listen(decision =>
             _children.ForEach(br => br._decision.Push(decision))
         );
@@ -56,7 +56,7 @@ public class TransactionContext : ITransactionContext
         return new TransactionContext(ch);
     }
 
-    public static ITransactionContext InitiateDefaultController(TransId transId, Action<string> Log)
+    public static ITransactionContext InitDefaultCoordinator(TransId transId, Action<string> Log)
     {
         var ch = new TrChannels(transId);
         ch._progress.Listen(pct =>
